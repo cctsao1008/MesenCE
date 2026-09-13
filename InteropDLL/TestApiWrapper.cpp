@@ -279,6 +279,7 @@ extern "C"
 						std::cout << ("\rRunning... (" + std::to_string(newProgress) + "%)");
 						progress = newProgress;
 					}
+				}
 			});
 		}
 
