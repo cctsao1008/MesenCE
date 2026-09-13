@@ -57,6 +57,72 @@ extern "C"
 		return result;
 	}
 
+	// Fami Pixel interop extension.
+	//
+	// The stock debugger Step() export is asynchronous from the caller's point
+	// of view. When a previous step has already stopped execution, a host-side
+	// IsExecutionStopped() poll can observe the old stopped state and report a
+	// false completion. This wrapper uses the emulator's native frame counter as
+	// the completion witness and does not return until both the requested frame
+	// advance and the new debugger stop have occurred.
+	//
+	// Return codes:
+	//   0 = success
+	//   1 = emulator is not running
+	//   2 = debugger is not initialized
+	//   3 = invalid frame count
+	//   4 = timeout waiting for frame advance
+	//   5 = timeout waiting for debugger stop
+	DllExport int32_t __stdcall FamiPixelStepFrame(uint32_t count, uint32_t timeoutMs)
+	{
+		if(count == 0) {
+			return 3;
+		}
+		if(!_emu || !_emu->IsRunning()) {
+			return 1;
+		}
+
+		Debugger* debugger = _emu->InternalGetDebugger();
+		if(!debugger) {
+			return 2;
+		}
+
+		uint32_t startFrame = _emu->GetFrameCount();
+		debugger->Step(CpuType::Nes, count, StepType::PpuFrame);
+
+		auto startTime = std::chrono::steady_clock::now();
+		auto timedOut = [&]() {
+			if(timeoutMs == 0) {
+				return false;
+			}
+			auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::steady_clock::now() - startTime
+			).count();
+			return elapsed >= timeoutMs;
+		};
+
+		while((uint32_t)(_emu->GetFrameCount() - startFrame) < count) {
+			if(timedOut()) {
+				return 4;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+
+		while(!debugger->IsExecutionStopped()) {
+			if(timedOut()) {
+				return 5;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+
+		return 0;
+	}
+
+	DllExport uint32_t __stdcall FamiPixelGetFrameCount()
+	{
+		return _emu ? _emu->GetFrameCount() : 0;
+	}
+
 	DllExport void __stdcall RomTestRecord(char* filename, bool reset)
 	{
 		_recordedRomTest.reset(new RecordedRomTest(_emu.get(), false));
@@ -148,7 +214,6 @@ extern "C"
 					if(nextTest >= testsToRun.size()) {
 						break;
 					}
-
 					RomTestResult result = RunRecordedTest(testsToRun[nextTest].c_str(), true);
 					if(result.State == RomTestState::Failed) {
 						failCount++;
