@@ -1,6 +1,8 @@
 #include "Common.h"
 #include "Core/Shared/Emulator.h"
 #include "Core/Shared/BaseControlDevice.h"
+#include "Core/Shared/BaseControlManager.h"
+#include "Core/Shared/Interfaces/IConsole.h"
 #include "Core/Shared/Interfaces/IInputProvider.h"
 #include "Core/NES/Input/NesController.h"
 
@@ -84,5 +86,28 @@ extern "C"
 
 		_famiPixelInputProvider->SetButtons(port, buttons);
 		return 0;
+	}
+
+	// Return the actual current state stored in the emulated NES controller.
+	// This is a witness for provider -> controller delivery, independent of
+	// game-specific RAM. Values 0..255 are valid controller bytes; -1 means the
+	// emulator/port/device is unavailable.
+	DllExport int32_t __stdcall FamiPixelGetNesControllerState(uint32_t port)
+	{
+		if(!_emu || !_emu->IsRunning() || port >= 2) {
+			return -1;
+		}
+
+		shared_ptr<IConsole> console = _emu->GetConsole();
+		if(!console) {
+			return -1;
+		}
+
+		shared_ptr<BaseControlDevice> device = console->GetControlManager()->GetControlDevice((uint8_t)port, 0);
+		shared_ptr<NesController> controller = std::dynamic_pointer_cast<NesController>(device);
+		if(!controller) {
+			return -1;
+		}
+		return (int32_t)controller->ToByte();
 	}
 }
