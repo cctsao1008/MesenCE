@@ -2,11 +2,64 @@
 #include "Core/Shared/RecordedRomTest.h"
 #include "Core/Shared/Emulator.h"
 #include "Core/Shared/EmuSettings.h"
+#include "Core/Shared/NotificationManager.h"
+#include "Core/Shared/Interfaces/INotificationListener.h"
 #include "Utilities/FolderUtilities.h"
 #include "Utilities/StringUtilities.h"
 
 extern unique_ptr<Emulator> _emu;
 shared_ptr<RecordedRomTest> _recordedRomTest;
+
+class FamiPixelFrameListener : public INotificationListener
+{
+private:
+	std::atomic<uint32_t> _frameEvents = 0;
+	std::mutex _mutex;
+	std::condition_variable _cv;
+
+public:
+	void ProcessNotification(ConsoleNotificationType type, void* parameter) override
+	{
+		if(type == ConsoleNotificationType::PpuFrameDone) {
+			_frameEvents.fetch_add(1, std::memory_order_release);
+			_cv.notify_all();
+		}
+	}
+
+	uint32_t GetFrameEvents() const
+	{
+		return _frameEvents.load(std::memory_order_acquire);
+	}
+
+	bool WaitForFrameEvents(uint32_t target, uint32_t timeoutMs)
+	{
+		std::unique_lock<std::mutex> lock(_mutex);
+		auto reached = [&]() {
+			return (int32_t)(_frameEvents.load(std::memory_order_acquire) - target) >= 0;
+		};
+		if(timeoutMs == 0) {
+			_cv.wait(lock, reached);
+			return true;
+		}
+		return _cv.wait_for(lock, std::chrono::milliseconds(timeoutMs), reached);
+	}
+};
+
+static shared_ptr<FamiPixelFrameListener> _famiPixelFrameListener;
+static Emulator* _famiPixelFrameListenerEmu = nullptr;
+
+static FamiPixelFrameListener* EnsureFamiPixelFrameListener()
+{
+	if(!_emu) {
+		return nullptr;
+	}
+	if(!_famiPixelFrameListener || _famiPixelFrameListenerEmu != _emu.get()) {
+		_famiPixelFrameListener = make_shared<FamiPixelFrameListener>();
+		_emu->GetNotificationManager()->RegisterNotificationListener(_famiPixelFrameListener);
+		_famiPixelFrameListenerEmu = _emu.get();
+	}
+	return _famiPixelFrameListener.get();
+}
 
 extern "C"
 {
@@ -60,19 +113,21 @@ extern "C"
 	// Fami Pixel interop extension.
 	//
 	// The stock debugger Step() export is asynchronous from the caller's point
-	// of view. When a previous step has already stopped execution, a host-side
-	// IsExecutionStopped() poll can observe the old stopped state and report a
-	// false completion. This wrapper uses the emulator's native frame counter as
-	// the completion witness and does not return until both the requested frame
-	// advance and the new debugger stop have occurred.
+	// of view. Synchronizing by polling Emulator::GetFrameCount() from the host
+	// thread is not a valid cross-thread contract because the NES PPU frame
+	// counter is owned and updated by the emulation thread. Instead, this wrapper
+	// waits for Mesen's PpuFrameDone notification, which is emitted by the
+	// emulation thread once per completed frame, and then waits for the debugger
+	// to reach the corresponding stopped state.
 	//
 	// Return codes:
 	//   0 = success
 	//   1 = emulator is not running
 	//   2 = debugger is not initialized
 	//   3 = invalid frame count
-	//   4 = timeout waiting for frame advance
+	//   4 = timeout waiting for PPU frame completion notification
 	//   5 = timeout waiting for debugger stop
+	//   6 = frame notification listener could not be initialized
 	DllExport int32_t __stdcall FamiPixelStepFrame(uint32_t count, uint32_t timeoutMs)
 	{
 		if(count == 0) {
@@ -87,10 +142,20 @@ extern "C"
 			return 2;
 		}
 
-		uint32_t startFrame = _emu->GetFrameCount();
+		FamiPixelFrameListener* listener = EnsureFamiPixelFrameListener();
+		if(!listener) {
+			return 6;
+		}
+
+		uint32_t startEvents = listener->GetFrameEvents();
+		uint32_t targetEvents = startEvents + count;
 		debugger->Step(CpuType::Nes, count, StepType::PpuFrame);
 
 		auto startTime = std::chrono::steady_clock::now();
+		if(!listener->WaitForFrameEvents(targetEvents, timeoutMs)) {
+			return 4;
+		}
+
 		auto timedOut = [&]() {
 			if(timeoutMs == 0) {
 				return false;
@@ -100,13 +165,6 @@ extern "C"
 			).count();
 			return elapsed >= timeoutMs;
 		};
-
-		while((uint32_t)(_emu->GetFrameCount() - startFrame) < count) {
-			if(timedOut()) {
-				return 4;
-			}
-			std::this_thread::sleep_for(std::chrono::milliseconds(1));
-		}
 
 		while(!debugger->IsExecutionStopped()) {
 			if(timedOut()) {
