@@ -14,7 +14,6 @@ class Spc;
 class BaseCartridge;
 class SnesMemoryManager;
 class InternalRegisters;
-class SnesDmaController;
 class EmuSettings;
 
 class ExpressionEvaluator;
@@ -85,7 +84,10 @@ private:
 
 	DebugControllerState _inputOverrides[8] = {};
 
-	bool _waitForBreakResume = false;
+	// Read by the emulation thread in SleepUntilResume() and cleared by the
+	// host/interoperability thread in Run()/Step(). This is a genuine
+	// cross-thread synchronization gate, so it must not be a plain bool.
+	atomic<bool> _waitForBreakResume = false;
 
 	void Reset();
 
@@ -178,30 +180,21 @@ public:
 	void Log(string message);
 	string GetLog();
 
-	bool SaveRomToDisk(string filename, bool saveAsIps, CdlStripOption stripOption);
-
-	void ClearExecutionTrace();
-	uint32_t GetExecutionTrace(TraceRow output[], uint32_t startOffset, uint32_t maxLineCount);
-
-	CpuType GetMainCpuType() { return _mainCpuType; }
-	IDebugger* GetCpuDebugger(CpuType cpuType);
-	IDebugger* GetMainDebugger();
-
-	TraceLogFileSaver* GetTraceLogFileSaver() { return _traceLogSaver.get(); }
 	MemoryDumper* GetMemoryDumper() { return _memoryDumper.get(); }
-	MemoryAccessCounter* GetMemoryAccessCounter() { return _memoryAccessCounter.get(); }
-	Disassembler* GetDisassembler() { return _disassembler.get(); }
 	DisassemblySearch* GetDisassemblySearch() { return _disassemblySearch.get(); }
+	MemoryAccessCounter* GetMemoryAccessCounter() { return _memoryAccessCounter.get(); }
+	CodeDataLogger* GetCodeDataLogger() { return _codeDataLogger.get(); }
+	Disassembler* GetDisassembler() { return _disassembler.get(); }
+	BreakpointManager* GetBreakpointManager(CpuType cpuType);
 	LabelManager* GetLabelManager() { return _labelManager.get(); }
 	CdlManager* GetCdlManager() { return _cdlManager.get(); }
 	ScriptManager* GetScriptManager() { return _scriptManager.get(); }
-	IConsole* GetConsole() { return _console; }
-	Emulator* GetEmulator() { return _emu; }
-
-	FrozenAddressManager* GetFrozenAddressManager(CpuType cpuType);
-	ITraceLogger* GetTraceLogger(CpuType cpuType);
-	PpuTools* GetPpuTools(CpuType cpuType);
 	BaseEventManager* GetEventManager(CpuType cpuType);
 	CallstackManager* GetCallstackManager(CpuType cpuType);
-	IAssembler* GetAssembler(CpuType cpuType);
+	ITraceLogger* GetTraceLogger(CpuType cpuType);
+	TraceLogFileSaver* GetTraceLogFileSaver() { return _traceLogSaver.get(); }
+
+	Emulator* GetEmulator() { return _emu; }
+	IConsole* GetConsole() { return _console; }
+	CpuType GetMainCpuType() { return _mainCpuType; }
 };
