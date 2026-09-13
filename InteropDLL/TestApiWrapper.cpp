@@ -54,7 +54,7 @@ static FamiPixelFrameListener* EnsureFamiPixelFrameListener()
 		return nullptr;
 	}
 	if(!_famiPixelFrameListener || _famiPixelFrameListenerEmu != _emu.get()) {
-		_famiPixelFrameListener = make_shared<FamiPixelFrameListener>();
+		_famiPixelFrameListener = std::make_shared<FamiPixelFrameListener>();
 		_emu->GetNotificationManager()->RegisterNotificationListener(_famiPixelFrameListener);
 		_famiPixelFrameListenerEmu = _emu.get();
 	}
@@ -113,21 +113,17 @@ extern "C"
 	// Fami Pixel interop extension.
 	//
 	// The stock debugger Step() export is asynchronous from the caller's point
-	// of view. Synchronizing by polling Emulator::GetFrameCount() from the host
-	// thread is not a valid cross-thread contract because the NES PPU frame
-	// counter is owned and updated by the emulation thread. Instead, this wrapper
-	// waits for Mesen's PpuFrameDone notification, which is emitted by the
-	// emulation thread once per completed frame, and then waits for the debugger
-	// to reach the corresponding stopped state.
+	// of view. A completed PPU frame is synchronized through Mesen's native
+	// PpuFrameDone notification rather than by polling a frame counter that is
+	// owned and updated by the emulation thread.
 	//
 	// Return codes:
 	//   0 = success
 	//   1 = emulator is not running
 	//   2 = debugger is not initialized
 	//   3 = invalid frame count
-	//   4 = timeout waiting for PPU frame completion notification
+	//   4 = timeout waiting for PPU frame completion
 	//   5 = timeout waiting for debugger stop
-	//   6 = frame notification listener could not be initialized
 	DllExport int32_t __stdcall FamiPixelStepFrame(uint32_t count, uint32_t timeoutMs)
 	{
 		if(count == 0) {
@@ -144,15 +140,15 @@ extern "C"
 
 		FamiPixelFrameListener* listener = EnsureFamiPixelFrameListener();
 		if(!listener) {
-			return 6;
+			return 1;
 		}
 
-		uint32_t startEvents = listener->GetFrameEvents();
-		uint32_t targetEvents = startEvents + count;
+		uint32_t startEvent = listener->GetFrameEvents();
+		uint32_t targetEvent = startEvent + count;
 		debugger->Step(CpuType::Nes, count, StepType::PpuFrame);
 
 		auto startTime = std::chrono::steady_clock::now();
-		if(!listener->WaitForFrameEvents(targetEvents, timeoutMs)) {
+		if(!listener->WaitForFrameEvents(targetEvent, timeoutMs)) {
 			return 4;
 		}
 
@@ -232,7 +228,6 @@ extern "C"
 		for(string& test : tests) {
 			string testPath = test.substr(testFolder.size());
 			std::replace(testPath.begin(), testPath.end(), '\\', '/');
-
 			bool include = true;
 			for(string& folderToSkip : foldersToSkip) {
 				if(StringUtilities::StartsWith(testPath, folderToSkip.c_str())) {
@@ -240,11 +235,9 @@ extern "C"
 					break;
 				}
 			}
-
 			if(testsToSkip.find(testPath) != testsToSkip.end()) {
 				include = false;
 			}
-
 			if(include) {
 				testsToRun.push_back(test);
 			}
@@ -286,7 +279,6 @@ extern "C"
 						std::cout << ("\rRunning... (" + std::to_string(newProgress) + "%)");
 						progress = newProgress;
 					}
-				}
 			});
 		}
 
