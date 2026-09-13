@@ -4,6 +4,7 @@
 #include "Core/Shared/BaseControlManager.h"
 #include "Core/Shared/Interfaces/IConsole.h"
 #include "Core/Shared/Interfaces/IInputProvider.h"
+#include "Core/Debugger/Debugger.h"
 #include "Core/NES/Input/NesController.h"
 
 extern unique_ptr<Emulator> _emu;
@@ -109,5 +110,80 @@ extern "C"
 			return -1;
 		}
 		return (int32_t)controller->ToByte();
+	}
+
+	// Copy the canonical raw NES PPU frame into caller-owned memory.
+	//
+	// The source is IConsole::GetPpuFrame(), which for NES maps directly to
+	// NesPpu::GetScreenBuffer(false). That storage is owned by the PPU and uses
+	// two alternating uint16_t buffers, so no pointer is exposed across the DLL
+	// boundary. The caller receives a stable copy instead.
+	//
+	// Pixel layout is Mesen's raw NES PPU color word after grayscale/emphasis
+	// processing: palette color in bits 0..5 and emphasis bits in 6..8.
+	// Width/height are currently 256x240 for NES.
+	//
+	// To prevent torn reads while the emulation thread is drawing or swapping
+	// buffers, this API requires an initialized debugger that is currently
+	// stopped (FamiPixelStepFrame provides that synchronization contract).
+	//
+	// Return codes:
+	//   0 = success
+	//   1 = emulator is not running
+	//   2 = console/framebuffer is unavailable or not the canonical NES size
+	//   3 = output buffer is null
+	//   4 = output capacity is too small (capacity is measured in uint16_t pixels)
+	//   5 = debugger is not initialized
+	//   6 = execution is not stopped
+	DllExport int32_t __stdcall FamiPixelCopyNesFrame(
+		uint16_t* output,
+		uint32_t pixelCapacity,
+		uint32_t* outWidth,
+		uint32_t* outHeight,
+		uint32_t* outFrameCount
+	)
+	{
+		if(!_emu || !_emu->IsRunning()) {
+			return 1;
+		}
+		if(!output) {
+			return 3;
+		}
+
+		Debugger* debugger = _emu->InternalGetDebugger();
+		if(!debugger) {
+			return 5;
+		}
+		if(!debugger->IsExecutionStopped()) {
+			return 6;
+		}
+
+		shared_ptr<IConsole> console = _emu->GetConsole();
+		if(!console) {
+			return 2;
+		}
+
+		PpuFrameInfo frame = console->GetPpuFrame();
+		constexpr uint32_t NesWidth = 256;
+		constexpr uint32_t NesHeight = 240;
+		constexpr uint32_t NesPixelCount = NesWidth * NesHeight;
+		if(!frame.FrameBuffer || frame.Width != NesWidth || frame.Height != NesHeight || frame.FrameBufferSize != NesPixelCount * sizeof(uint16_t)) {
+			return 2;
+		}
+		if(pixelCapacity < NesPixelCount) {
+			return 4;
+		}
+
+		memcpy(output, frame.FrameBuffer, frame.FrameBufferSize);
+		if(outWidth) {
+			*outWidth = frame.Width;
+		}
+		if(outHeight) {
+			*outHeight = frame.Height;
+		}
+		if(outFrameCount) {
+			*outFrameCount = frame.FrameCount;
+		}
+		return 0;
 	}
 }
