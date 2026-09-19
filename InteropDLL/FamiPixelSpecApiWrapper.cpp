@@ -258,12 +258,16 @@ extern "C"
 		return 0;
 	}
 
-	// Advance the speculative NES directly through IConsole::RunFrame().
-	// No debugger Step(), frame limiter, input poll or emulation-thread
-	// rendezvous is used. Call FamiPixelSpecSetNesControllerState() at each
-	// desired input boundary before advancing the corresponding frame/chunk.
+	// Advance the speculative NES through the Emulator-owned direct-frame gate.
+	// That gate reuses Mesen's run-ahead semantics so a threadless speculative
+	// instance bypasses output/pacing hooks without touching the live emulator.
 	//
-	// Return codes: 0 = success, 1 = unavailable, 2 = non-NES console, 3 = count=0.
+	// Return codes:
+	//   0 = success
+	//   1 = unavailable
+	//   2 = non-NES console
+	//   3 = count=0
+	//   4 = speculative frame gate rejected execution
 	DllExport int32_t __stdcall FamiPixelSpecRunFrames(uint32_t count)
 	{
 		if(!_famiPixelSpecEmu || !_famiPixelSpecEmu->IsRunning()) {
@@ -276,12 +280,10 @@ extern "C"
 			return 3;
 		}
 
-		shared_ptr<IConsole> console = _famiPixelSpecEmu->GetConsole();
-		if(!console) {
-			return 1;
-		}
 		for(uint32_t i = 0; i < count; i++) {
-			console->RunFrame();
+			if(!_famiPixelSpecEmu->RunSpeculativeFrame()) {
+				return 4;
+			}
 		}
 		return 0;
 	}
