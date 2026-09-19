@@ -108,6 +108,19 @@ namespace
 			false
 		);
 	}
+
+	shared_ptr<NesController> GetSpecController(uint32_t port)
+	{
+		if(!_famiPixelSpecEmu || !_famiPixelSpecEmu->IsRunning() || port >= 2) {
+			return nullptr;
+		}
+		shared_ptr<IConsole> console = _famiPixelSpecEmu->GetConsole();
+		if(!console) {
+			return nullptr;
+		}
+		shared_ptr<BaseControlDevice> device = console->GetControlManager()->GetControlDevice((uint8_t)port, 0);
+		return std::dynamic_pointer_cast<NesController>(device);
+	}
 }
 
 extern "C"
@@ -150,11 +163,8 @@ extern "C"
 			return 3;
 		}
 
-		unique_ptr<FamiPixelSpecInputProvider> inputProvider(new FamiPixelSpecInputProvider());
-		specEmu->RegisterInputProvider(inputProvider.get());
-
 		_famiPixelSpecEmu = std::move(specEmu);
-		_famiPixelSpecInputProvider = std::move(inputProvider);
+		_famiPixelSpecInputProvider.reset(new FamiPixelSpecInputProvider());
 		_famiPixelSpecConsoleType = consoleType;
 		_famiPixelSpecRomSha1 = romSha1;
 		_famiPixelSpecRootState = rootState;
@@ -211,9 +221,16 @@ extern "C"
 		return LoadSpecState(_famiPixelSpecRootState, _famiPixelSpecConsoleType) == DeserializeResult::Success ? 0 : 4;
 	}
 
-	// Set the deterministic controller byte consumed by the dedicated spec
-	// instance. The provider is polled immediately before each direct RunFrame().
-	// Return codes: 0 = success, 1 = spec runner unavailable, 2 = invalid port.
+	// Set the deterministic controller byte directly on the dedicated
+	// speculative controller. This mirrors the live IInputProvider mapping but
+	// deliberately avoids BaseControlManager::UpdateInputState(), whose global
+	// KeyManager refresh is unrelated to a headless speculative instance.
+	//
+	// Return codes:
+	//   0 = success
+	//   1 = spec runner unavailable
+	//   2 = invalid port
+	//   3 = NES controller device unavailable
 	DllExport int32_t __stdcall FamiPixelSpecSetNesControllerState(uint32_t port, uint8_t buttons)
 	{
 		if(!_famiPixelSpecEmu || !_famiPixelSpecEmu->IsRunning() || !_famiPixelSpecInputProvider) {
@@ -222,14 +239,26 @@ extern "C"
 		if(port >= 2) {
 			return 2;
 		}
+
+		shared_ptr<NesController> controller = GetSpecController(port);
+		if(!controller) {
+			return 3;
+		}
+
 		_famiPixelSpecInputProvider->SetButtons(port, buttons);
+		controller->ClearState();
+		if(!_famiPixelSpecInputProvider->SetInput(controller.get())) {
+			return 3;
+		}
+		controller->OnAfterSetState();
 		return 0;
 	}
 
 	// Advance the speculative NES directly through IConsole::RunFrame().
-	// No debugger Step(), frame limiter or emulation-thread rendezvous is used.
-	// The provider is refreshed at each frame boundary so a caller can preserve
-	// frame-exact input semantics by issuing one-frame or chunked calls.
+	// No debugger Step(), frame limiter, input poll or emulation-thread
+	// rendezvous is used. Call FamiPixelSpecSetNesControllerState() at each
+	// desired input boundary before advancing the corresponding frame/chunk.
+	//
 	// Return codes: 0 = success, 1 = unavailable, 2 = non-NES console, 3 = count=0.
 	DllExport int32_t __stdcall FamiPixelSpecRunFrames(uint32_t count)
 	{
@@ -248,7 +277,6 @@ extern "C"
 			return 1;
 		}
 		for(uint32_t i = 0; i < count; i++) {
-			console->GetControlManager()->UpdateInputState();
 			console->RunFrame();
 		}
 		return 0;
@@ -258,15 +286,7 @@ extern "C"
 	// Values 0..255 are valid; -1 means unavailable/invalid port/device.
 	DllExport int32_t __stdcall FamiPixelSpecGetNesControllerState(uint32_t port)
 	{
-		if(!_famiPixelSpecEmu || !_famiPixelSpecEmu->IsRunning() || port >= 2) {
-			return -1;
-		}
-		shared_ptr<IConsole> console = _famiPixelSpecEmu->GetConsole();
-		if(!console) {
-			return -1;
-		}
-		shared_ptr<BaseControlDevice> device = console->GetControlManager()->GetControlDevice((uint8_t)port, 0);
-		shared_ptr<NesController> controller = std::dynamic_pointer_cast<NesController>(device);
+		shared_ptr<NesController> controller = GetSpecController(port);
 		return controller ? (int32_t)controller->ToByte() : -1;
 	}
 
