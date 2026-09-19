@@ -1,5 +1,10 @@
 #pragma once
 
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+
 #if _WIN32 || _WIN64
 	#pragma comment(lib, "ws2_32.lib") //Winsock Library
 	#define DllExport __declspec(dllexport)
