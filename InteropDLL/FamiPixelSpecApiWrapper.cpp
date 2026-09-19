@@ -91,7 +91,11 @@ namespace
 			auto lock = _emu->AcquireLock();
 			consoleType = _emu->GetConsoleType();
 			romSha1 = _emu->GetHash(HashType::Sha1);
-			_emu->Serialize(stream, false, 0);
+			// Cross-instance cloning must include emulation-impacting settings.
+			// In particular, NES controller types are part of EmuSettings::Serialize;
+			// loading them before the console state lets NesControlManager recreate
+			// the same devices before their serialized state is restored.
+			_emu->Serialize(stream, true, 0);
 		}
 		state = stream.str();
 		return !state.empty();
@@ -103,7 +107,7 @@ namespace
 		return _famiPixelSpecEmu->Deserialize(
 			stream,
 			SaveStateManager::FileFormatVersion,
-			false,
+			true,
 			consoleType,
 			false
 		);
