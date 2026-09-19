@@ -3,21 +3,27 @@
 #include <sstream>
 #include <string>
 
+#include "Core/Debugger/Debugger.h"
+#include "Core/Debugger/IDebugger.h"
 #include "Core/Shared/Emulator.h"
 #include "Core/Shared/BaseControlDevice.h"
 #include "Core/Shared/BaseControlManager.h"
 #include "Core/Shared/EmuSettings.h"
 #include "Core/Shared/MemoryType.h"
+#include "Core/Shared/NotificationManager.h"
 #include "Core/Shared/RomInfo.h"
 #include "Core/Shared/SaveStateManager.h"
 #include "Core/Shared/Interfaces/IConsole.h"
 #include "Core/Shared/Interfaces/IInputProvider.h"
+#include "Core/Shared/Interfaces/INotificationListener.h"
 #include "Core/NES/Input/NesController.h"
 
 extern unique_ptr<Emulator> _emu;
 
 namespace
 {
+	constexpr uint32_t SpecNesRamSize = 0x800;
+
 	class FamiPixelSpecInputProvider : public IInputProvider
 	{
 	private:
@@ -63,12 +69,14 @@ namespace
 	unique_ptr<Emulator> _famiPixelSpecEmu;
 	unique_ptr<FamiPixelSpecInputProvider> _famiPixelSpecInputProvider;
 	bool _famiPixelSpecInputRegistered = false;
+	shared_ptr<INotificationListener> _famiPixelSpecScheduleListener;
 	string _famiPixelSpecRootState;
 	string _famiPixelSpecRomSha1;
 	ConsoleType _famiPixelSpecConsoleType = {};
 
 	void ReleaseSpecRunner()
 	{
+		_famiPixelSpecScheduleListener.reset();
 		if(_famiPixelSpecEmu) {
 			if(_famiPixelSpecInputRegistered && _famiPixelSpecInputProvider && _famiPixelSpecEmu->IsRunning()) {
 				_famiPixelSpecEmu->UnregisterInputProvider(_famiPixelSpecInputProvider.get());
@@ -116,7 +124,7 @@ namespace
 			SaveStateManager::FileFormatVersion,
 			true,
 			consoleType,
-			false
+			_famiPixelSpecEmu->IsDebugging()
 		);
 	}
 
@@ -132,13 +140,127 @@ namespace
 		shared_ptr<BaseControlDevice> device = console->GetControlManager()->GetControlDevice((uint8_t)port, 0);
 		return std::dynamic_pointer_cast<NesController>(device);
 	}
+
+	bool ArmSpecPpuFrame(Debugger* debugger)
+	{
+		if(!debugger) {
+			return false;
+		}
+		IDebugger* nesDebugger = debugger->GetCpuDebugger(CpuType::Nes);
+		if(!nesDebugger) {
+			return false;
+		}
+
+		// Bypass Debugger::Step() here because the speculative Emulator has no
+		// emulation thread. The underlying NES step request is the exact same
+		// PpuFrame countdown used by the live authoritative path.
+		nesDebugger->ResetStepBackCache();
+		nesDebugger->Step(1, StepType::PpuFrame);
+		return true;
+	}
+
+	class FamiPixelSpecScheduleListener : public INotificationListener
+	{
+	private:
+		Emulator* _emu = nullptr;
+		Debugger* _debugger = nullptr;
+		FamiPixelSpecInputProvider* _provider = nullptr;
+		uint32_t _port = 0;
+		const uint8_t* _buttons = nullptr;
+		uint32_t _count = 0;
+		uint8_t* _ramOutput = nullptr;
+		uint8_t* _controllerOutput = nullptr;
+		uint32_t* _frameCountOutput = nullptr;
+		uint32_t _index = 0;
+		bool _failed = false;
+		bool _complete = false;
+
+	public:
+		FamiPixelSpecScheduleListener(
+			Emulator* emu,
+			Debugger* debugger,
+			FamiPixelSpecInputProvider* provider,
+			uint32_t port,
+			const uint8_t* buttons,
+			uint32_t count,
+			uint8_t* ramOutput,
+			uint8_t* controllerOutput,
+			uint32_t* frameCountOutput
+		) :
+			_emu(emu),
+			_debugger(debugger),
+			_provider(provider),
+			_port(port),
+			_buttons(buttons),
+			_count(count),
+			_ramOutput(ramOutput),
+			_controllerOutput(controllerOutput),
+			_frameCountOutput(frameCountOutput)
+		{
+		}
+
+		void ProcessNotification(ConsoleNotificationType type, void* parameter) override
+		{
+			if(type != ConsoleNotificationType::CodeBreak || _complete || _failed) {
+				return;
+			}
+
+			if(!_emu || !_debugger || !_provider || _index >= _count) {
+				_failed = true;
+				if(_debugger) {
+					_debugger->Run();
+				}
+				return;
+			}
+
+			ConsoleMemoryInfo memory = _emu->GetMemory(MemoryType::NesInternalRam);
+			shared_ptr<NesController> controller = GetSpecController(_port);
+			if(!memory.Memory || memory.Size < SpecNesRamSize || !controller) {
+				_failed = true;
+				_debugger->Run();
+				return;
+			}
+
+			// SleepUntilResume() calls NesDebugger::OnBeforeBreak() before CodeBreak,
+			// so the APU has already been caught up exactly as on the live path.
+			memcpy(
+				_ramOutput + ((size_t)_index * SpecNesRamSize),
+				memory.Memory,
+				SpecNesRamSize
+			);
+			_controllerOutput[_index] = controller->ToByte();
+			_frameCountOutput[_index] = _emu->GetFrameCount();
+			_index++;
+
+			// Synchronously release this exact debugger boundary. Notification
+			// delivery is synchronous, so no emulation cycle can run between
+			// changing the requested input and arming the next PPU-frame period.
+			_debugger->Run();
+
+			if(_index >= _count) {
+				_complete = true;
+				return;
+			}
+
+			_provider->SetButtons(_port, _buttons[_index]);
+			if(!ArmSpecPpuFrame(_debugger)) {
+				_failed = true;
+			}
+		}
+
+		bool Failed() const { return _failed; }
+		bool Complete() const { return _complete; }
+		uint32_t CapturedCount() const { return _index; }
+	};
 }
 
 extern "C"
 {
 	// Create one dedicated speculative NES Emulator from the current live root.
-	// The speculative instance intentionally has no emulation thread and no
-	// debugger. Frames are advanced only by FamiPixelSpecRunFrames().
+	// The speculative instance intentionally has no emulation thread. The exact
+	// multi-frame schedule path may create an internal debugger only to reuse
+	// Mesen's authoritative PPU-frame boundary counter; it never performs a
+	// host-side debugger sleep/wake round trip.
 	//
 	// Return codes:
 	//   0 = success
@@ -265,16 +387,11 @@ extern "C"
 		return 0;
 	}
 
-	// Advance the speculative NES through the Emulator-owned direct-frame gate.
-	// That gate reuses Mesen's run-ahead semantics so a threadless speculative
-	// instance bypasses output/pacing hooks without touching the live emulator.
-	//
-	// Return codes:
-	//   0 = success
-	//   1 = unavailable
-	//   2 = non-NES console
-	//   3 = count=0
-	//   4 = speculative frame gate rejected execution
+	// Low-level frame-count-edge primitive retained for diagnostics only.
+	// NesConsole::RunFrame() stops when the PPU frame counter changes; that is
+	// NOT equivalent to the live Debugger::Step(PpuFrame) full-period boundary
+	// when execution begins at an arbitrary PPU phase. Exact rollouts should use
+	// FamiPixelSpecRunSchedule().
 	DllExport int32_t __stdcall FamiPixelSpecRunFrames(uint32_t count)
 	{
 		if(!_famiPixelSpecEmu || !_famiPixelSpecEmu->IsRunning()) {
@@ -291,6 +408,115 @@ extern "C"
 			if(!_famiPixelSpecEmu->RunSpeculativeFrame()) {
 				return 4;
 			}
+		}
+		return 0;
+	}
+
+	// Execute a variable-input schedule continuously while sampling witnesses at
+	// the exact same PPU-frame-period boundaries as the live debugger path.
+	// The internal CodeBreak listener immediately captures the witness, changes
+	// the requested input for the next period, and resumes synchronously. This
+	// preserves mid-instruction continuity without host polling or serialization
+	// at the intermediate boundaries.
+	//
+	// ramOutput layout: frameCount consecutive 0x800-byte NES internal-RAM images.
+	// Return codes:
+	//   0 = success
+	//   1 = spec runner unavailable
+	//   2 = non-NES console
+	//   3 = invalid port/count/buttons
+	//   4 = NES controller unavailable
+	//   5 = output pointer/capacity invalid
+	//   6 = speculative debugger unavailable
+	//   7 = boundary capture/next-step failure
+	//   8 = direct speculative frame gate rejected execution
+	//   9 = expected boundary count was not reached
+	DllExport int32_t __stdcall FamiPixelSpecRunSchedule(
+		uint32_t port,
+		const uint8_t* buttons,
+		uint32_t frameCount,
+		uint8_t* ramOutput,
+		uint32_t ramCapacity,
+		uint8_t* controllerOutput,
+		uint32_t controllerCapacity,
+		uint32_t* frameCountOutput,
+		uint32_t frameCountCapacity
+	)
+	{
+		if(!_famiPixelSpecEmu || !_famiPixelSpecEmu->IsRunning() || !_famiPixelSpecInputProvider || !_famiPixelSpecInputRegistered) {
+			return 1;
+		}
+		if(_famiPixelSpecEmu->GetConsoleType() != ConsoleType::Nes) {
+			return 2;
+		}
+		if(port >= 2 || !buttons || frameCount == 0) {
+			return 3;
+		}
+		if(!GetSpecController(port)) {
+			return 4;
+		}
+		if(!ramOutput || !controllerOutput || !frameCountOutput || frameCount > UINT32_MAX / SpecNesRamSize) {
+			return 5;
+		}
+		uint32_t requiredRam = frameCount * SpecNesRamSize;
+		if(ramCapacity < requiredRam || controllerCapacity < frameCount || frameCountCapacity < frameCount) {
+			return 5;
+		}
+
+		if(!_famiPixelSpecEmu->IsDebugging()) {
+			_famiPixelSpecEmu->InitDebugger();
+		}
+		Debugger* debugger = _famiPixelSpecEmu->InternalGetDebugger();
+		if(!debugger) {
+			return 6;
+		}
+
+		shared_ptr<FamiPixelSpecScheduleListener> listener(new FamiPixelSpecScheduleListener(
+			_famiPixelSpecEmu.get(),
+			debugger,
+			_famiPixelSpecInputProvider.get(),
+			port,
+			buttons,
+			frameCount,
+			ramOutput,
+			controllerOutput,
+			frameCountOutput
+		));
+		_famiPixelSpecScheduleListener = listener;
+		_famiPixelSpecEmu->GetNotificationManager()->RegisterNotificationListener(listener);
+
+		_famiPixelSpecInputProvider->SetButtons(port, buttons[0]);
+		if(!ArmSpecPpuFrame(debugger)) {
+			_famiPixelSpecScheduleListener.reset();
+			return 6;
+		}
+
+		// RunFrame() is only the coarse execution pump here. Exact witnesses are
+		// captured by the synchronous debugger boundary listener inside PPU-cycle
+		// processing. A full PPU period can span two RunFrame() calls when the root
+		// begins after the PPU frame-counter edge, so use a bounded generous guard.
+		uint64_t maxPumps = (uint64_t)frameCount * 2 + 4;
+		uint64_t pumps = 0;
+		while(!listener->Complete() && !listener->Failed() && pumps < maxPumps) {
+			pumps++;
+			if(!_famiPixelSpecEmu->RunSpeculativeFrame()) {
+				debugger->Run();
+				_famiPixelSpecScheduleListener.reset();
+				return 8;
+			}
+		}
+
+		bool failed = listener->Failed();
+		bool complete = listener->Complete();
+		uint32_t captured = listener->CapturedCount();
+		_famiPixelSpecScheduleListener.reset();
+
+		if(failed) {
+			return 7;
+		}
+		if(!complete || captured != frameCount) {
+			debugger->Run();
+			return 9;
 		}
 		return 0;
 	}
