@@ -2,8 +2,10 @@
 #include "Core/Shared/Emulator.h"
 #include "Core/Shared/BaseControlDevice.h"
 #include "Core/Shared/BaseControlManager.h"
+#include "Core/Shared/NotificationManager.h"
 #include "Core/Shared/Interfaces/IConsole.h"
 #include "Core/Shared/Interfaces/IInputProvider.h"
+#include "Core/Shared/Interfaces/INotificationListener.h"
 #include "Core/Debugger/Debugger.h"
 #include "Core/NES/Input/NesController.h"
 
@@ -53,6 +55,60 @@ public:
 
 static unique_ptr<FamiPixelInputProvider> _famiPixelInputProvider;
 static bool _famiPixelInputRegistered = false;
+
+// Probe-only frame listener used to decompose the exact debugger-step latency.
+// It intentionally mirrors the synchronization shape used by FamiPixelStepFrame
+// without changing the production stepping export.
+class FamiPixelTimingFrameListener : public INotificationListener
+{
+private:
+	std::atomic<uint32_t> _frameEvents = 0;
+	std::mutex _mutex;
+	std::condition_variable _cv;
+
+public:
+	void ProcessNotification(ConsoleNotificationType type, void* parameter) override
+	{
+		if(type == ConsoleNotificationType::PpuFrameDone) {
+			_frameEvents.fetch_add(1, std::memory_order_release);
+			_cv.notify_all();
+		}
+	}
+
+	uint32_t GetFrameEvents() const
+	{
+		return _frameEvents.load(std::memory_order_acquire);
+	}
+
+	bool WaitForFrameEvents(uint32_t target, uint32_t timeoutMs)
+	{
+		std::unique_lock<std::mutex> lock(_mutex);
+		auto reached = [&]() {
+			return (int32_t)(_frameEvents.load(std::memory_order_acquire) - target) >= 0;
+		};
+		if(timeoutMs == 0) {
+			_cv.wait(lock, reached);
+			return true;
+		}
+		return _cv.wait_for(lock, std::chrono::milliseconds(timeoutMs), reached);
+	}
+};
+
+static shared_ptr<FamiPixelTimingFrameListener> _famiPixelTimingFrameListener;
+static Emulator* _famiPixelTimingFrameListenerEmu = nullptr;
+
+static FamiPixelTimingFrameListener* EnsureFamiPixelTimingFrameListener()
+{
+	if(!_emu) {
+		return nullptr;
+	}
+	if(!_famiPixelTimingFrameListener || _famiPixelTimingFrameListenerEmu != _emu.get()) {
+		_famiPixelTimingFrameListener = std::make_shared<FamiPixelTimingFrameListener>();
+		_emu->GetNotificationManager()->RegisterNotificationListener(_famiPixelTimingFrameListener);
+		_famiPixelTimingFrameListenerEmu = _emu.get();
+	}
+	return _famiPixelTimingFrameListener.get();
+}
 
 extern "C"
 {
@@ -110,6 +166,96 @@ extern "C"
 			return -1;
 		}
 		return (int32_t)controller->ToByte();
+	}
+
+	// Probe-only decomposition of the exact debugger PPU-frame step path.
+	// The timing outputs partition one synchronous call into:
+	//   stepCallNs  = debugger->Step() call duration
+	//   frameWaitNs = wait after Step returns until PpuFrameDone is observed
+	//   stopWaitNs  = wait after the frame witness until IsExecutionStopped()
+	//   totalNs     = complete native call duration from before Step to stop
+	//
+	// Output pointers are optional. Return codes match FamiPixelStepFrame.
+	DllExport int32_t __stdcall FamiPixelProfileStepFrame(
+		uint32_t count,
+		uint32_t timeoutMs,
+		uint64_t* outStepCallNs,
+		uint64_t* outFrameWaitNs,
+		uint64_t* outStopWaitNs,
+		uint64_t* outTotalNs
+	)
+	{
+		auto writeOutput = [](uint64_t* output, uint64_t value) {
+			if(output) {
+				*output = value;
+			}
+		};
+		writeOutput(outStepCallNs, 0);
+		writeOutput(outFrameWaitNs, 0);
+		writeOutput(outStopWaitNs, 0);
+		writeOutput(outTotalNs, 0);
+
+		if(count == 0) {
+			return 3;
+		}
+		if(!_emu || !_emu->IsRunning()) {
+			return 1;
+		}
+
+		Debugger* debugger = _emu->InternalGetDebugger();
+		if(!debugger) {
+			return 2;
+		}
+
+		FamiPixelTimingFrameListener* listener = EnsureFamiPixelTimingFrameListener();
+		if(!listener) {
+			return 1;
+		}
+
+		auto elapsedNs = [](auto start, auto end) -> uint64_t {
+			return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+		};
+
+		uint32_t startEvent = listener->GetFrameEvents();
+		uint32_t targetEvent = startEvent + count;
+		auto t0 = std::chrono::steady_clock::now();
+		debugger->Step(CpuType::Nes, count, StepType::PpuFrame);
+		auto tStepReturned = std::chrono::steady_clock::now();
+		writeOutput(outStepCallNs, elapsedNs(t0, tStepReturned));
+
+		if(!listener->WaitForFrameEvents(targetEvent, timeoutMs)) {
+			auto tTimedOut = std::chrono::steady_clock::now();
+			writeOutput(outFrameWaitNs, elapsedNs(tStepReturned, tTimedOut));
+			writeOutput(outTotalNs, elapsedNs(t0, tTimedOut));
+			return 4;
+		}
+		auto tFrameObserved = std::chrono::steady_clock::now();
+		writeOutput(outFrameWaitNs, elapsedNs(tStepReturned, tFrameObserved));
+
+		auto timedOut = [&]() {
+			if(timeoutMs == 0) {
+				return false;
+			}
+			auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::steady_clock::now() - tStepReturned
+			).count();
+			return elapsed >= timeoutMs;
+		};
+
+		while(!debugger->IsExecutionStopped()) {
+			if(timedOut()) {
+				auto tTimedOut = std::chrono::steady_clock::now();
+				writeOutput(outStopWaitNs, elapsedNs(tFrameObserved, tTimedOut));
+				writeOutput(outTotalNs, elapsedNs(t0, tTimedOut));
+				return 5;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+
+		auto tStopped = std::chrono::steady_clock::now();
+		writeOutput(outStopWaitNs, elapsedNs(tFrameObserved, tStopped));
+		writeOutput(outTotalNs, elapsedNs(t0, tStopped));
+		return 0;
 	}
 
 	// Copy the canonical raw NES PPU frame into caller-owned memory.
