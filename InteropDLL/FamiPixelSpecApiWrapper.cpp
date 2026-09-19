@@ -62,6 +62,7 @@ namespace
 
 	unique_ptr<Emulator> _famiPixelSpecEmu;
 	unique_ptr<FamiPixelSpecInputProvider> _famiPixelSpecInputProvider;
+	bool _famiPixelSpecInputRegistered = false;
 	string _famiPixelSpecRootState;
 	string _famiPixelSpecRomSha1;
 	ConsoleType _famiPixelSpecConsoleType = {};
@@ -69,10 +70,16 @@ namespace
 	void ReleaseSpecRunner()
 	{
 		if(_famiPixelSpecEmu) {
+			if(_famiPixelSpecInputRegistered && _famiPixelSpecInputProvider && _famiPixelSpecEmu->IsRunning()) {
+				_famiPixelSpecEmu->UnregisterInputProvider(_famiPixelSpecInputProvider.get());
+			}
+			_famiPixelSpecInputRegistered = false;
+
 			// The speculative instance must not persist battery/recent-game state.
 			_famiPixelSpecEmu->Stop(false, true, false);
 			_famiPixelSpecEmu->Release();
 		}
+		_famiPixelSpecInputRegistered = false;
 		_famiPixelSpecInputProvider.reset();
 		_famiPixelSpecEmu.reset();
 		_famiPixelSpecRootState.clear();
@@ -177,6 +184,13 @@ extern "C"
 			ReleaseSpecRunner();
 			return 4;
 		}
+
+		// Match the live fami-pixel input contract exactly: the provider owns the
+		// requested byte, while the NES core applies it at its native InputScanline
+		// through BaseControlManager::UpdateInputState(). Do not mutate the
+		// controller eagerly at the API boundary.
+		_famiPixelSpecEmu->RegisterInputProvider(_famiPixelSpecInputProvider.get());
+		_famiPixelSpecInputRegistered = true;
 		return 0;
 	}
 
@@ -225,10 +239,10 @@ extern "C"
 		return LoadSpecState(_famiPixelSpecRootState, _famiPixelSpecConsoleType) == DeserializeResult::Success ? 0 : 4;
 	}
 
-	// Set the deterministic controller byte directly on the dedicated
-	// speculative controller. This mirrors the live IInputProvider mapping but
-	// deliberately avoids BaseControlManager::UpdateInputState(), whose global
-	// KeyManager refresh is unrelated to a headless speculative instance.
+	// Set the deterministic controller byte on the dedicated speculative input
+	// provider. The NES core consumes it at its normal input-poll point, matching
+	// FamiPixelSetNesControllerState() on the live emulator. This is deliberately
+	// not an eager mutation of NesController::_state.
 	//
 	// Return codes:
 	//   0 = success
@@ -237,24 +251,17 @@ extern "C"
 	//   3 = NES controller device unavailable
 	DllExport int32_t __stdcall FamiPixelSpecSetNesControllerState(uint32_t port, uint8_t buttons)
 	{
-		if(!_famiPixelSpecEmu || !_famiPixelSpecEmu->IsRunning() || !_famiPixelSpecInputProvider) {
+		if(!_famiPixelSpecEmu || !_famiPixelSpecEmu->IsRunning() || !_famiPixelSpecInputProvider || !_famiPixelSpecInputRegistered) {
 			return 1;
 		}
 		if(port >= 2) {
 			return 2;
 		}
-
-		shared_ptr<NesController> controller = GetSpecController(port);
-		if(!controller) {
+		if(!GetSpecController(port)) {
 			return 3;
 		}
 
 		_famiPixelSpecInputProvider->SetButtons(port, buttons);
-		controller->ClearState();
-		if(!_famiPixelSpecInputProvider->SetInput(controller.get())) {
-			return 3;
-		}
-		controller->OnAfterSetState();
 		return 0;
 	}
 
