@@ -251,6 +251,20 @@ public:
 	bool IsRunning() { return _console != nullptr; }
 	bool IsRunAheadFrame() { return _isRunAheadFrame; }
 
+	// Execute one synchronous frame on a threadless Emulator instance while
+	// reusing Mesen's run-ahead semantics to suppress frame pacing/output hooks.
+	// Refuse to run if the normal emulation thread exists, so this cannot race it.
+	bool RunSpeculativeFrame()
+	{
+		if(!_console || _emuThread) {
+			return false;
+		}
+		bool previousRunAhead = _isRunAheadFrame.exchange(true);
+		_console->RunFrame();
+		_isRunAheadFrame = previousRunAhead;
+		return true;
+	}
+
 	TimingInfo GetTimingInfo(CpuType cpuType);
 	uint32_t GetFrameCount();
 
